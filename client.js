@@ -1,10 +1,5 @@
-var http = require('http');
 var spdy = require('spdy');
-var heapdump = require('heapdump');
 var argo = require('argo');
-var titan = require('titan');
-var WebSocketServer = require('ws').Server;
-var SpdyAgent = require('./spdy_agent');
 var WebSocket = require('./web_socket');
 
 var server = spdy.createServer({
@@ -20,10 +15,24 @@ var server = spdy.createServer({
 
 
 var cloud = argo()
+    .use(function(handle) {
+      handle('request', function(env, next) {
+        if (env.request.url === '/push') {
+          var data = new Buffer(JSON.stringify({ timestamp: new Date().getTime() }));
+          var opts = {
+            request: { 'Host': 'fog.argo.cx',
+                       'Content-Length': data.length
+                     },
+          };
+          var stream = env.response.push('/event', opts);
+          stream.end(data);
+        }
+        next(env);
+      })
+    })
     .target("http://localhost:1337");
 
 cloud = cloud.build();
-//server.on('request', cloud.run);
 server.on('request', cloud.run);
 
 console.log('Connecting to ', process.argv[2])

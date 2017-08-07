@@ -1,6 +1,5 @@
 var http = require('http');
 var spdy = require('spdy');
-var heapdump = require('heapdump');
 var argo = require('argo');
 var titan = require('titan');
 var WebSocketServer = require('ws').Server;
@@ -65,6 +64,33 @@ var cloud = argo()
       request.on('connect', function() {
         console.log('http.connect')
       });
+
+      request.on('push', function(stream) {
+        var encoding = stream.headers['x-event-encoding'] || 'json';
+        var length = Number(stream.headers['content-length']);
+        console.log(stream.headers);
+        var data = Buffer.alloc(length);
+        var idx = 0;
+        var d = null;
+        stream.on('readable', function() {
+          while (d = stream.read()) {
+            for (var i=0; i<d.length;i++) {
+              data[idx++] = d[i];
+            }
+          };
+        });
+
+        stream.on('error', function(err) {
+          console.log('stream error:', err)
+        })
+
+        stream.on('end', function() {
+          var json = JSON.parse(data.toString());
+          console.log(json);
+          stream.destroy();
+        });
+
+      })
       
       if (req.body) {
         request.end(req.body);

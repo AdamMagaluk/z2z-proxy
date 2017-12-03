@@ -10,9 +10,7 @@ var SpdyAgent = module.exports = function(options) {
 util.inherits(SpdyAgent, Agent);
 
 SpdyAgent.prototype.createConnection = function(options) {
-  console.log('SpdyAgent.createConnection');
   setTimeout(function() {
-    console.log('connect...')
     options.socket.emit('connect');
   }, 0)
   return options.socket;

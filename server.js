@@ -18,6 +18,7 @@ var server = spdy.createServer({
 });
 
 var agent = null;
+var pingInterval = null;
 
 var topics = 0;
 var cloud = argo()
@@ -61,10 +62,6 @@ var cloud = argo()
         return next(env);
       });
 
-      request.on('connect', function() {
-        console.log('http.connect')
-      });
-
       request.on('push', function(stream) {
         var encoding = stream.headers['x-event-encoding'] || 'json';
         var length = Number(stream.headers['content-length']);
@@ -106,7 +103,6 @@ server.on('request', cloud.run);
 
 var wss = new WebSocketServer({ server: server });
 wss.on('connection', function(ws) {
-  console.log('ws connect')
   ws._socket.removeAllListeners('data'); // Remove WebSocket data handler.
 
   ws.on('error', function(err) {
@@ -114,7 +110,6 @@ wss.on('connection', function(ws) {
   })
 
   agent = spdy.createAgent(SpdyAgent, {
-    host: this.name,
     port: 80,
     socket: ws._socket,
     spdy: {
@@ -123,13 +118,18 @@ wss.on('connection', function(ws) {
       protocol: 'h2',
     }
   });
+  
+  clearInterval(pingInterval);
+  
+  agent.once('_connect', function() {
+    pingInterval = setInterval(function() {
+      agent._spdyState.connection.ping();
+    }, 500);
+  });
 
   agent.maxSockets = 150;
-  agent.on('_connect', function() {
-    console.log('_connect');
-  })
   agent.on('error', function(err) {
-    console.log('agent error:', err);
+    console.error('agent error:', err);
     agent.close();
   });
 });

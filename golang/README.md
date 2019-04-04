@@ -13,17 +13,24 @@ Start the server. Contains a cloud server listening on `http://localhost:3000` a
 Once the servers on listening the `hub` will try to peer to the `http://localhot:3000/hijack`.
 
 
+**Start A Cloud Instance**
 ```
-go run server.go
-```
-
-Make a request wich travels over the z2z connection.
-
-```
-curl -v -H "Peer:peer" localhost:3000/proxy
+go run server.go --address ":3000"
 ```
 
-This makes a request to cloud `/proxy` which forwards the request to the hub's `/hi` path.
+**Start a Hub**
+```
+go run server.go --address ":3001" --peer "http://localhost:3000" --id peer1
+```
+
+
+Make a request wich travels over the z2z connection. Note: The Peer header and the `id` flag must match.
+
+```
+curl -v -H "Peer:peer1" localhost:3000/proxy/hi?test=abc
+```
+
+This makes a request to cloud `/proxy/hi` which forwards the request to the hub with the id `peer1` to it's `/hi` path.
 
 
 ## Server Pushes

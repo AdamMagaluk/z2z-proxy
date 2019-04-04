@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"flag"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,7 +27,9 @@ type peerClient struct {
 // Caches peerClients based on a peer id. Each peer id may contain
 // multiple clients.
 type clientCache struct {
-	mu      sync.Mutex
+	mu sync.RWMutex
+	// TODO: Look at using https://golang.org/pkg/sync/#Map or a sharded map.
+	// Or https://github.com/orcaman/concurrent-map
 	clients map[string][]*peerClient
 }
 
@@ -45,30 +49,93 @@ func (cc *clientCache) tryAddClient(peer *peerClient) error {
 
 // Lookup connections for the peer id.
 func (cc *clientCache) lookupClient(id string) ([]*peerClient, bool) {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
+	cc.mu.RLock()
+	defer cc.mu.RUnlock()
 
 	clients, ok := cc.clients[id]
 	return clients, ok
 }
 
+// Lookup connections for the peer id. Return a list of peer ids that
+// have been remvoed. TODO: Can return more than one peer id.
+func (cc *clientCache) removeDisconnectedConnections() []string {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	clientsClosed := []string{}
+	for k, connections := range cc.clients {
+		for i, conn := range connections {
+			if !conn.h2Client.CanTakeNewRequest() {
+				cc.clients[k][i] = cc.clients[k][len(cc.clients[k])-1]
+				cc.clients[k][len(cc.clients[k])-1] = nil
+				cc.clients[k] = cc.clients[k][:len(cc.clients[k])-1]
+				clientsClosed = append(clientsClosed, conn.id)
+			}
+		}
+		if len(cc.clients[k]) == 0 {
+			delete(cc.clients, k)
+		}
+	}
+
+	return clientsClosed
+}
+
 func main() {
 	http2.VerboseLogs = os.Getenv("DEBUG") != ""
 
+	bindAddress := flag.String("address", "localhost:3000", "local address to bind to")
+	peer := flag.String("peer", "", "host to peer to")
+	peerID := flag.String("id", "peer1", "id of peer")
+	flag.Parse()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
 	// Create a "cloud" instance of the server and listne
-	cloud := createServer("localhost:3000")
-	go cloud.ListenAndServe()
+	server, connPool := createServer(*bindAddress)
+	go func(wg *sync.WaitGroup) {
+		// a channel to tell it to stop
+		stopchan := make(chan struct{})
 
-	// Create a "hub" instance of the server and listne
-	hub := createServer("localhost:30001")
-	go hub.ListenAndServe()
+		defer close(stopchan)
 
-	// Peer to the cloud server. If disconnected reconnect.
-	for {
-		// Peer to a given address and proxy h2 requests to the hub server.
-		peerToServer("http://localhost:3000/hijack", hub)
-		time.Sleep(time.Second * 1)
+		// Check and remove connections that have been closed.
+		// TODO: This is inefficient and may cause contention when getting the
+		// reader lock on each loop.
+		go func() { // work in background
+			for {
+				select {
+				default:
+					closed := connPool.removeDisconnectedConnections()
+					for _, peerID := range closed {
+						log.Printf("Peer connection for %s has been closed.", peerID)
+					}
+				case <-stopchan:
+					// stop
+					return
+				}
+
+				time.Sleep(time.Millisecond * 100)
+			}
+		}()
+
+		err := server.ListenAndServe()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		wg.Done()
+	}(&wg)
+
+	if *peer != "" {
+		// Peer to the cloud server. If disconnected reconnect.
+		for {
+			// Peer to a given address and proxy h2 requests to the hub server.
+			peerToServer(*peer+"/peer/"+*peerID, server)
+			time.Sleep(time.Second * 1)
+		}
 	}
+	wg.Wait()
 }
 
 // Tries to peer to a remote server wit the z2z methods. Proxies all received
@@ -139,17 +206,17 @@ func peerToServer(url string, server *http.Server) {
 	log.Printf("Peer connection %s Closed....", url)
 }
 
-func createServer(address string) *http.Server {
+func createServer(address string) (*http.Server, *clientCache) {
 	// Init a peer cache
-	clientCache := clientCache{
+	clientCache := &clientCache{
 		clients: make(map[string][]*peerClient),
 	}
 
 	// Create a new ServerMux to seperate from the default from the cloud server in the same binary.
 	mux := http.NewServeMux()
 
-	// Proxy usrl
-	mux.HandleFunc("/proxy", func(rw http.ResponseWriter, req *http.Request) {
+	// Proxy handler.
+	mux.HandleFunc("/proxy/", func(rw http.ResponseWriter, req *http.Request) {
 		// Peer ID from HEADER
 		peerID := req.Header.Get("Peer")
 
@@ -198,8 +265,8 @@ func createServer(address string) *http.Server {
 		// connection over the same TCP socket and fail.
 		outreq.URL.Host = peerID
 
-		// TODO: Hardcode for now. Should strip base path out.
-		outreq.URL.Path = "/hi"
+		// Strip the /proxy base path out.
+		outreq.URL.Path = strings.TrimPrefix(outreq.URL.Path, "/proxy")
 
 		// Needs to be set for h2 client.
 		outreq.URL.Scheme = "https"
@@ -207,7 +274,7 @@ func createServer(address string) *http.Server {
 		// Proxy the request.
 		resp, err := h2Client.RoundTrip(outreq)
 		if err != nil {
-			http.Error(rw, "Connection failed", http.StatusBadGateway)
+			http.Error(rw, err.Error(), http.StatusBadGateway)
 			return
 		}
 		// Copy the response headers.
@@ -225,17 +292,20 @@ func createServer(address string) *http.Server {
 	})
 
 	mux.HandleFunc("/hello", func(w http.ResponseWriter, req *http.Request) {
+		log.Printf("Hello handler")
 		io.WriteString(w, "Hello, world!\n")
 	})
 
 	mux.HandleFunc("/hi", func(w http.ResponseWriter, req *http.Request) {
+		log.Printf("Hi handler")
 		w.Header().Set("Other Header", "OK")
 		w.WriteHeader(200)
 		io.WriteString(w, "Hub Received proxy request!\n")
 	})
 
-	mux.HandleFunc("/hijack", func(w http.ResponseWriter, req *http.Request) {
-		log.Printf("Received Hijack Request")
+	mux.HandleFunc("/peer/", func(w http.ResponseWriter, req *http.Request) {
+		peerID := strings.TrimPrefix(req.URL.Path, "/peer/")
+		log.Printf("Received Peering Request %s", peerID)
 
 		// Hijack the TCP connection from the HTTP ResponseWriter.
 		hj, ok := w.(http.Hijacker)
@@ -283,13 +353,28 @@ func createServer(address string) *http.Server {
 
 		// Create a dialer that when dialTLS is called will return the hijacked connection.
 		client := &peerClient{
-			id:       "peer",
+			id:       peerID,
 			h2Client: cc,
 		}
 
 		// Add client to client cache the /proxy request handler uses this to
 		// send http requests to a peered conncetion.
 		clientCache.tryAddClient(client)
+
+		// Example of Server to Clinet h2 Ping
+		// go func() {
+		// 	for {
+		// 		d := time.Now().Add(time.Second * 30)
+		// 		ctx, cancel := context.WithDeadline(context.Background(), d)
+		// 		err := cc.Ping(ctx)
+		// 		if err != nil {
+		// 			log.Printf("Ping to peer %s failed. %s", peerID, err.Error())
+		// 		}
+		// 		cancel()
+
+		// 		time.Sleep(time.Second * 1)
+		// 	}
+		// }()
 
 		// Example of CLOUD side shutdown.
 		// go func() {
@@ -303,7 +388,7 @@ func createServer(address string) *http.Server {
 	return &http.Server{
 		Addr:    address,
 		Handler: mux,
-	}
+	}, clientCache
 }
 
 // Taken from https://github.com/golang/go/blob/master/src/net/http/httputil/reverseproxy.go
